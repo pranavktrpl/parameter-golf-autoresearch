@@ -1,0 +1,18 @@
+# macOS metadata
+.DS_Store
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Local experiment outputs
+run.log
+results.tsv
+logs/
+
+# Large local data artifacts (keep scripts/docs tracked)
+data/datasets/
+data/tokenizers/
+data/manifest.json
+data/docs_selected.jsonl
+data/docs_selected.source_manifest.json

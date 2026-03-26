@@ -35,11 +35,10 @@ COMPUTE_DTYPE = mx.bfloat16
 # ==============================================================================
 # HYPERPARAMETERS
 # ==============================================================================
-# Default Simple Baseline run:
-# - 9 transformer blocks at width 512
-# - 8 attention heads with 4 KV heads (GQA) and 2x MLP expansion
-# - vocab size 1024, sequence length 1024, tied embeddings
-# - 524,288 train tokens per step for 20,000 iterations with a ~10 minute cap
+# Default run is safety-biased for local Macs:
+# - explicit MLX memory caps (unified memory / GPU allocator)
+# - smaller train/val batches and microbatches
+# - compile disabled by default to reduce peak memory pressure
 class Hyperparameters:
     # Data / tokenizer.
     data_path: str = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
@@ -47,21 +46,27 @@ class Hyperparameters:
     run_id: str = os.environ.get("RUN_ID", str(uuid.uuid4()))
     seed: int = int(os.environ.get("SEED", 1337))
 
-    # Training loop. These defaults now mirror train_gpt.py on a single process.
+    # Training loop. Defaults are conservative to avoid crashing local machines.
     iterations: int = int(os.environ.get("ITERATIONS", 20_000))
     val_loss_every: int = int(os.environ.get("VAL_LOSS_EVERY", 0))
     # Validation always uses the full fineweb_val split.
-    val_batch_size: int = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
+    val_batch_size: int = int(os.environ.get("VAL_BATCH_SIZE", 131_072))
     train_log_every: int = int(os.environ.get("TRAIN_LOG_EVERY", 200))
-    train_batch_tokens: int = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
-    grad_accum_steps: int = int(os.environ.get("GRAD_ACCUM_STEPS", 8))
+    train_batch_tokens: int = int(os.environ.get("TRAIN_BATCH_TOKENS", 131_072))
+    grad_accum_steps: int = int(os.environ.get("GRAD_ACCUM_STEPS", 16))
     train_seq_len: int = int(os.environ.get("TRAIN_SEQ_LEN", os.environ.get("TRAIN_MAX_SEQ_LEN", 1024)))
     # Chunk each logical MLX microbatch into smaller sub-batches to reduce peak
     # memory pressure without changing the effective optimizer batch.
-    mlx_max_microbatch_tokens: int = int(os.environ.get("MLX_MAX_MICROBATCH_TOKENS", 8_192))
-    warmup_steps: int = int(os.environ.get("WARMUP_STEPS", 20))
+    mlx_max_microbatch_tokens: int = int(os.environ.get("MLX_MAX_MICROBATCH_TOKENS", 4_096))
+    warmup_steps: int = int(os.environ.get("WARMUP_STEPS", 5))
     warmdown_iters: int = int(os.environ.get("WARMDOWN_ITERS", 1200))
     max_wallclock_seconds: float = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
+    use_compiled_graphs: bool = bool(int(os.environ.get("USE_COMPILED_GRAPHS", "0")))
+
+    # Hard MLX allocator caps (GiB). Set <= 0 to disable a specific cap.
+    mlx_memory_limit_gb: float = float(os.environ.get("MLX_MEMORY_LIMIT_GB", 10.0))
+    mlx_cache_limit_gb: float = float(os.environ.get("MLX_CACHE_LIMIT_GB", 1.0))
+    mlx_wired_limit_gb: float = float(os.environ.get("MLX_WIRED_LIMIT_GB", 2.0))
 
     # Model (defaults match the current baseline setup).
     vocab_size: int = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -821,6 +826,26 @@ def clip_grad_tree(grads_tree: dict, max_norm: float) -> dict:
     return tree_unflatten([(k, g * scale) for k, g in flat.items()])
 
 
+def gib_to_bytes(gib: float) -> int:
+    return int(gib * (1024 ** 3))
+
+
+def apply_mlx_memory_limits(args: Hyperparameters, log_fn: Callable[[str], None]) -> None:
+    limits = [
+        ("memory_limit", args.mlx_memory_limit_gb, mx.set_memory_limit),
+        ("cache_limit", args.mlx_cache_limit_gb, mx.set_cache_limit),
+    ]
+    if hasattr(mx, "set_wired_limit"):
+        limits.append(("wired_limit", args.mlx_wired_limit_gb, mx.set_wired_limit))
+    for name, gib, setter in limits:
+        if gib <= 0:
+            log_fn(f"mlx_{name}:disabled")
+            continue
+        bytes_limit = gib_to_bytes(gib)
+        setter(bytes_limit)
+        log_fn(f"mlx_{name}:{gib:.2f}GiB ({bytes_limit} bytes)")
+
+
 def main() -> None:
     # ==============================================================================
     # TOKENIZER + VALIDATION METRIC SETUP
@@ -843,6 +868,8 @@ def main() -> None:
     log(f"Running Python {sys.version}", console=False)
     log(f"Running MLX {mx.__version__}", console=False)
     log("=" * 100, console=False)
+
+    apply_mlx_memory_limits(args, log)
 
     if not args.tie_embeddings:
         raise NotImplementedError("train_gpt_mlx.py only supports tied embeddings")
@@ -895,12 +922,16 @@ def main() -> None:
     # inside RoPE modules), so compiling only against trainable parameters throws "uncaptured inputs".
     # Compiling the model-bound functions and capturing the full model state fixes that while still
     # returning gradients only for trainable parameters via nn.value_and_grad(...).
-    compiled_loss = mx.compile(lambda x, y: model.loss(x, y), inputs=model.state, outputs=model.state)
-    compiled_loss_and_grad = mx.compile(
-        nn.value_and_grad(model, lambda x, y: model.loss(x, y)),
-        inputs=model.state,
-        outputs=model.state,
-    )
+    if args.use_compiled_graphs:
+        compiled_loss = mx.compile(lambda x, y: model.loss(x, y), inputs=model.state, outputs=model.state)
+        compiled_loss_and_grad = mx.compile(
+            nn.value_and_grad(model, lambda x, y: model.loss(x, y)),
+            inputs=model.state,
+            outputs=model.state,
+        )
+    else:
+        compiled_loss = lambda x, y: model.loss(x, y)
+        compiled_loss_and_grad = nn.value_and_grad(model, lambda x, y: model.loss(x, y))
 
     # Print config once so logs are self-describing.
     n_params = sum(int(np.prod(p.shape)) for _, p in tree_flatten(model.parameters()))
@@ -938,7 +969,7 @@ def main() -> None:
         f"muon_momentum:{args.muon_momentum} muon_steps:{args.muon_backend_steps}"
     )
     log(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
-    log(f"compute_dtype:{COMPUTE_DTYPE} compile:True")
+    log(f"compute_dtype:{COMPUTE_DTYPE} compile:{args.use_compiled_graphs}")
     log(
         f"dtypes tok_emb:{model.tok_emb.weight.dtype} "
         f"linear_weight:{model.blocks[0].attn.c_q.weight.dtype} "
