@@ -50,18 +50,23 @@ class Hyperparameters:
     iterations: int = int(os.environ.get("ITERATIONS", 20_000))
     val_loss_every: int = int(os.environ.get("VAL_LOSS_EVERY", 0))
     # Validation always uses the full fineweb_val split.
-    val_batch_size: int = int(os.environ.get("VAL_BATCH_SIZE", 262_144))
+    val_batch_size: int = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
     train_log_every: int = int(os.environ.get("TRAIN_LOG_EVERY", 200))
-    train_batch_tokens: int = int(os.environ.get("TRAIN_BATCH_TOKENS", 262_144))
+    train_batch_tokens: int = int(os.environ.get("TRAIN_BATCH_TOKENS", 131_072))
     grad_accum_steps: int = int(os.environ.get("GRAD_ACCUM_STEPS", 8))
     train_seq_len: int = int(os.environ.get("TRAIN_SEQ_LEN", os.environ.get("TRAIN_MAX_SEQ_LEN", 1024)))
     # Chunk each logical MLX microbatch into smaller sub-batches to reduce peak
     # memory pressure without changing the effective optimizer batch.
     mlx_max_microbatch_tokens: int = int(os.environ.get("MLX_MAX_MICROBATCH_TOKENS", 8_192))
-    warmup_steps: int = int(os.environ.get("WARMUP_STEPS", 5))
+    warmup_steps: int = int(os.environ.get("WARMUP_STEPS", 0))
     warmdown_iters: int = int(os.environ.get("WARMDOWN_ITERS", 1200))
     max_wallclock_seconds: float = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
+    # Optional hard cap for the entire process (startup + train + eval). Disabled by default.
+    hard_wallclock_seconds: float = float(os.environ.get("HARD_WALLCLOCK_SECONDS", 0.0))
+    # Cap post-train work (final validation + optional artifact work).
+    post_train_wallclock_seconds: float = float(os.environ.get("POST_TRAIN_WALLCLOCK_SECONDS", 300.0))
     use_compiled_graphs: bool = bool(int(os.environ.get("USE_COMPILED_GRAPHS", "1")))
+    run_quant_roundtrip_eval: bool = bool(int(os.environ.get("RUN_QUANT_ROUNDTRIP_EVAL", "0")))
 
     # Hard MLX allocator caps (GiB). Set <= 0 to disable a specific cap.
     mlx_memory_limit_gb: float = float(os.environ.get("MLX_MEMORY_LIMIT_GB", 16.0))
@@ -77,7 +82,7 @@ class Hyperparameters:
     mlp_mult: int = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings: bool = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     tied_embed_init_std: float = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
-    logit_chunk_tokens: int = int(os.environ.get("LOGIT_CHUNK_TOKENS", 4_096))
+    logit_chunk_tokens: int = int(os.environ.get("LOGIT_CHUNK_TOKENS", 2_048))
     logit_softcap: float = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     rope_base: float = float(os.environ.get("ROPE_BASE", 10000.0))
     qk_gain_init: float = float(os.environ.get("QK_GAIN_INIT", 1.5))
@@ -764,6 +769,7 @@ def eval_val(
     base_bytes_lut: np.ndarray,
     has_leading_space_lut: np.ndarray,
     is_boundary_token_lut: np.ndarray,
+    hard_deadline_s: float | None = None,
 ) -> tuple[float, float]:
     # Validation computes two metrics:
     # - val_loss: token cross-entropy (natural log)
@@ -781,6 +787,8 @@ def eval_val(
     total_tokens = 0.0
     total_bytes = 0.0
     for batch_seq_start in range(0, total_seqs, val_batch_seqs):
+        if hard_deadline_s is not None and time.perf_counter() >= hard_deadline_s:
+            raise TimeoutError("Hard wallclock timeout reached during validation.")
         batch_seq_end = min(batch_seq_start + val_batch_seqs, total_seqs)
         raw_start = batch_seq_start * args.train_seq_len
         raw_end = batch_seq_end * args.train_seq_len + 1
@@ -851,6 +859,12 @@ def main() -> None:
     # TOKENIZER + VALIDATION METRIC SETUP
     # ==============================================================================
     args = Hyperparameters()
+    run_start_s = time.perf_counter()
+    hard_deadline_s = (
+        run_start_s + args.hard_wallclock_seconds
+        if args.hard_wallclock_seconds > 0
+        else None
+    )
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     logfile = out_dir / f"{args.run_id}.txt"
@@ -868,6 +882,8 @@ def main() -> None:
     log(f"Running Python {sys.version}", console=False)
     log(f"Running MLX {mx.__version__}", console=False)
     log("=" * 100, console=False)
+    if hard_deadline_s is not None:
+        log(f"hard_wallclock_seconds:{args.hard_wallclock_seconds:.1f}")
 
     apply_mlx_memory_limits(args, log)
 
@@ -959,7 +975,8 @@ def main() -> None:
         f"iterations:{args.iterations} train_batch_tokens:{args.train_batch_tokens} grad_accum_steps:{args.grad_accum_steps} "
         f"microbatch_tokens:{args.microbatch_tokens} microbatch_batch_size:{args.microbatch_tokens // args.train_seq_len} "
         f"val_batch_size:{args.val_batch_size} "
-        f"warmup_steps:{args.warmup_steps} max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
+        f"warmup_steps:{args.warmup_steps} max_wallclock_seconds:{args.max_wallclock_seconds:.3f} "
+        f"post_train_wallclock_seconds:{args.post_train_wallclock_seconds:.3f}"
     )
     log(f"mlx_max_microbatch_tokens:{args.mlx_max_microbatch_tokens}")
     log(
@@ -970,6 +987,7 @@ def main() -> None:
     )
     log(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log(f"compute_dtype:{COMPUTE_DTYPE} compile:{args.use_compiled_graphs}")
+    log(f"run_quant_roundtrip_eval:{args.run_quant_roundtrip_eval}")
     log(
         f"dtypes tok_emb:{model.tok_emb.weight.dtype} "
         f"linear_weight:{model.blocks[0].attn.c_q.weight.dtype} "
@@ -985,6 +1003,8 @@ def main() -> None:
         # Instead we run the real train shapes, force the loss/grads to materialize, and then reset
         # the loader so measured training still starts from the true init and token window.
         for warmup_step in range(args.warmup_steps):
+            if hard_deadline_s is not None and time.perf_counter() >= hard_deadline_s:
+                raise TimeoutError("Hard wallclock timeout reached during warmup.")
             accum: dict[str, mx.array] | None = None
             warmup_loss = mx.array(0.0, dtype=mx.float32)
             grad_scale = 1.0 / args.grad_accum_steps
@@ -1016,11 +1036,16 @@ def main() -> None:
 
     train_time_ms = 0.0
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
+    post_train_deadline_s: float | None = None
     stop_after_step: int | None = None
     t0 = time.perf_counter()
     step = 0
     while True:
+        if hard_deadline_s is not None and time.perf_counter() >= hard_deadline_s:
+            raise TimeoutError("Hard wallclock timeout reached during training.")
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
+        if last_step and post_train_deadline_s is None and args.post_train_wallclock_seconds > 0:
+            post_train_deadline_s = time.perf_counter() + args.post_train_wallclock_seconds
         if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
             # Validation always scans the same fixed full validation split.
             val_loss, val_bpb = eval_val(
@@ -1030,6 +1055,7 @@ def main() -> None:
                 base_bytes_lut,
                 has_leading_space_lut,
                 is_boundary_token_lut,
+                hard_deadline_s=post_train_deadline_s if last_step else None,
             )
             train_time_ms += 1000.0 * (time.perf_counter() - t0)
             if step % 25 == 0 or last_step:
@@ -1073,11 +1099,17 @@ def main() -> None:
             stop_after_step = step
 
     # ==============================================================================
-    # FINAL SERIALIZATION + QUANTIZED ROUNDTRIP EVAL
+    # OPTIONAL QUANTIZED ROUNDTRIP EVAL (POST-TRAIN BUDGETED)
     # ==============================================================================
-    # We always write a raw artifact and a quantized artifact, then validate the
-    # quantized roundtrip directly by loading the dequantized tensors back into the
-    # model and running one final validation pass.
+    if not args.run_quant_roundtrip_eval:
+        log("final_int8_zlib_roundtrip:skipped")
+        return
+    if post_train_deadline_s is None and args.post_train_wallclock_seconds > 0:
+        post_train_deadline_s = time.perf_counter() + args.post_train_wallclock_seconds
+    if post_train_deadline_s is not None and time.perf_counter() >= post_train_deadline_s:
+        log("post_train_budget_exhausted: skipping quantized roundtrip")
+        return
+
     out_path = out_dir / f"{args.run_id}_mlx_model.npz"
     flat_state = {k: v for k, v in tree_flatten(model.state)}
     mx.savez(str(out_path), **flat_state)
@@ -1109,6 +1141,7 @@ def main() -> None:
         base_bytes_lut,
         has_leading_space_lut,
         is_boundary_token_lut,
+        hard_deadline_s=post_train_deadline_s,
     )
     q_eval_ms = 1000.0 * (time.perf_counter() - q_t0)
     log(f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{q_eval_ms:.0f}ms")
