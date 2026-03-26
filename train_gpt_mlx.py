@@ -46,27 +46,27 @@ class Hyperparameters:
     run_id: str = os.environ.get("RUN_ID", str(uuid.uuid4()))
     seed: int = int(os.environ.get("SEED", 1337))
 
-    # Training loop. Defaults are conservative to avoid crashing local machines.
+    # Training loop. Defaults keep memory bounded without tanking throughput.
     iterations: int = int(os.environ.get("ITERATIONS", 20_000))
     val_loss_every: int = int(os.environ.get("VAL_LOSS_EVERY", 0))
     # Validation always uses the full fineweb_val split.
-    val_batch_size: int = int(os.environ.get("VAL_BATCH_SIZE", 131_072))
+    val_batch_size: int = int(os.environ.get("VAL_BATCH_SIZE", 262_144))
     train_log_every: int = int(os.environ.get("TRAIN_LOG_EVERY", 200))
-    train_batch_tokens: int = int(os.environ.get("TRAIN_BATCH_TOKENS", 131_072))
-    grad_accum_steps: int = int(os.environ.get("GRAD_ACCUM_STEPS", 16))
+    train_batch_tokens: int = int(os.environ.get("TRAIN_BATCH_TOKENS", 262_144))
+    grad_accum_steps: int = int(os.environ.get("GRAD_ACCUM_STEPS", 8))
     train_seq_len: int = int(os.environ.get("TRAIN_SEQ_LEN", os.environ.get("TRAIN_MAX_SEQ_LEN", 1024)))
     # Chunk each logical MLX microbatch into smaller sub-batches to reduce peak
     # memory pressure without changing the effective optimizer batch.
-    mlx_max_microbatch_tokens: int = int(os.environ.get("MLX_MAX_MICROBATCH_TOKENS", 4_096))
+    mlx_max_microbatch_tokens: int = int(os.environ.get("MLX_MAX_MICROBATCH_TOKENS", 8_192))
     warmup_steps: int = int(os.environ.get("WARMUP_STEPS", 5))
     warmdown_iters: int = int(os.environ.get("WARMDOWN_ITERS", 1200))
     max_wallclock_seconds: float = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
-    use_compiled_graphs: bool = bool(int(os.environ.get("USE_COMPILED_GRAPHS", "0")))
+    use_compiled_graphs: bool = bool(int(os.environ.get("USE_COMPILED_GRAPHS", "1")))
 
     # Hard MLX allocator caps (GiB). Set <= 0 to disable a specific cap.
-    mlx_memory_limit_gb: float = float(os.environ.get("MLX_MEMORY_LIMIT_GB", 10.0))
-    mlx_cache_limit_gb: float = float(os.environ.get("MLX_CACHE_LIMIT_GB", 1.0))
-    mlx_wired_limit_gb: float = float(os.environ.get("MLX_WIRED_LIMIT_GB", 2.0))
+    mlx_memory_limit_gb: float = float(os.environ.get("MLX_MEMORY_LIMIT_GB", 16.0))
+    mlx_cache_limit_gb: float = float(os.environ.get("MLX_CACHE_LIMIT_GB", 2.0))
+    mlx_wired_limit_gb: float = float(os.environ.get("MLX_WIRED_LIMIT_GB", 0.0))
 
     # Model (defaults match the current baseline setup).
     vocab_size: int = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -77,7 +77,7 @@ class Hyperparameters:
     mlp_mult: int = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings: bool = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     tied_embed_init_std: float = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
-    logit_chunk_tokens: int = int(os.environ.get("LOGIT_CHUNK_TOKENS", 0))
+    logit_chunk_tokens: int = int(os.environ.get("LOGIT_CHUNK_TOKENS", 4_096))
     logit_softcap: float = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     rope_base: float = float(os.environ.get("ROPE_BASE", 10000.0))
     qk_gain_init: float = float(os.environ.get("QK_GAIN_INIT", 1.5))
