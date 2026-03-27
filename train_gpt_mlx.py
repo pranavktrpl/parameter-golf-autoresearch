@@ -949,6 +949,26 @@ def main() -> None:
         compiled_loss = lambda x, y: model.loss(x, y)
         compiled_loss_and_grad = nn.value_and_grad(model, lambda x, y: model.loss(x, y))
 
+    eval_graph_primed = False
+    if args.use_compiled_graphs:
+        # Compile the eval graph before training so final validation does not pay a huge
+        # first-call compile cost inside the post-train budget window.
+        val_batch_tokens = args.val_batch_size // args.grad_accum_steps
+        if val_batch_tokens < args.train_seq_len:
+            raise ValueError(
+                "VAL_BATCH_SIZE must provide at least one sequence; "
+                f"got VAL_BATCH_SIZE={args.val_batch_size}, GRAD_ACCUM_STEPS={args.grad_accum_steps}, "
+                f"TRAIN_SEQ_LEN={args.train_seq_len}"
+            )
+        prime_val_seqs = min(val_batch_tokens // args.train_seq_len, (val_tokens.size - 1) // args.train_seq_len)
+        prime_chunk = val_tokens[: prime_val_seqs * args.train_seq_len + 1]
+        x_prime = mx.array(prime_chunk[:-1].reshape(-1, args.train_seq_len), dtype=mx.int32)
+        y_prime = mx.array(prime_chunk[1:].reshape(-1, args.train_seq_len), dtype=mx.int32)
+        prime_loss = compiled_loss(x_prime, y_prime)
+        mx.eval(prime_loss)
+        mx.synchronize()
+        eval_graph_primed = True
+
     # Print config once so logs are self-describing.
     n_params = sum(int(np.prod(p.shape)) for _, p in tree_flatten(model.parameters()))
     log(f"run_id:{args.run_id}")
@@ -1016,21 +1036,23 @@ def main() -> None:
             if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
                 log(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
 
-        # Prime the standalone eval graph once too. It is compiled separately from value_and_grad.
-        val_batch_tokens = args.val_batch_size // args.grad_accum_steps
-        if val_batch_tokens < args.train_seq_len:
-            raise ValueError(
-                "VAL_BATCH_SIZE must provide at least one sequence; "
-                f"got VAL_BATCH_SIZE={args.val_batch_size}, GRAD_ACCUM_STEPS={args.grad_accum_steps}, "
-                f"TRAIN_SEQ_LEN={args.train_seq_len}"
-            )
-        warm_val_seqs = min(val_batch_tokens // args.train_seq_len, (val_tokens.size - 1) // args.train_seq_len)
-        warm_chunk = val_tokens[: warm_val_seqs * args.train_seq_len + 1]
-        x_val = mx.array(warm_chunk[:-1].reshape(-1, args.train_seq_len), dtype=mx.int32)
-        y_val = mx.array(warm_chunk[1:].reshape(-1, args.train_seq_len), dtype=mx.int32)
-        warm_val_loss = compiled_loss(x_val, y_val)
-        mx.eval(warm_val_loss)
-        mx.synchronize()
+        # If compile is off we do not need graph priming. If compile is on and we already
+        # primed above, skip duplicate work.
+        if args.use_compiled_graphs and not eval_graph_primed:
+            val_batch_tokens = args.val_batch_size // args.grad_accum_steps
+            if val_batch_tokens < args.train_seq_len:
+                raise ValueError(
+                    "VAL_BATCH_SIZE must provide at least one sequence; "
+                    f"got VAL_BATCH_SIZE={args.val_batch_size}, GRAD_ACCUM_STEPS={args.grad_accum_steps}, "
+                    f"TRAIN_SEQ_LEN={args.train_seq_len}"
+                )
+            warm_val_seqs = min(val_batch_tokens // args.train_seq_len, (val_tokens.size - 1) // args.train_seq_len)
+            warm_chunk = val_tokens[: warm_val_seqs * args.train_seq_len + 1]
+            x_val = mx.array(warm_chunk[:-1].reshape(-1, args.train_seq_len), dtype=mx.int32)
+            y_val = mx.array(warm_chunk[1:].reshape(-1, args.train_seq_len), dtype=mx.int32)
+            warm_val_loss = compiled_loss(x_val, y_val)
+            mx.eval(warm_val_loss)
+            mx.synchronize()
 
         train_loader = TokenLoader(args.train_files, log_fn=log, dataset_name=dataset_name)
 
